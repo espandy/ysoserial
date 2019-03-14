@@ -1,8 +1,6 @@
 package ysoserial.payloads;
 
 
-import static com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl.DESERIALIZE_TRANSLET;
-
 import java.io.File;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -12,24 +10,16 @@ import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.Callable;
 
-import org.hamcrest.CoreMatchers;
 import org.jboss.shrinkwrap.resolver.api.maven.Maven;
 import org.junit.Assert;
 import org.junit.Assume;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.contrib.java.lang.system.ProvideSecurityManager;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
 
-import ysoserial.CustomDeserializer;
-import ysoserial.CustomPayloadArgs;
-import ysoserial.CustomTest;
-import ysoserial.Deserializer;
-import ysoserial.Serializer;
-import ysoserial.Throwables;
-import ysoserial.WrappedTest;
+import ysoserial.*;
+import ysoserial.util.Throwables;
 import ysoserial.payloads.TestHarnessTest.ExecMockPayload;
 import ysoserial.payloads.TestHarnessTest.NoopMockPayload;
 import ysoserial.payloads.annotation.Dependencies;
@@ -51,9 +41,6 @@ TODO: figure out better way to test exception behavior than comparing messages
 } )
 @RunWith ( Parameterized.class )
 public class PayloadsTest {
-
-    private static final String ASSERT_MESSAGE = "should have thrown " + ExecException.class.getSimpleName();
-
 
     @Parameters ( name = "payloadClass: {0}" )
     public static Class<? extends ObjectPayload<?>>[] payloads () {
@@ -79,67 +66,69 @@ public class PayloadsTest {
     public static void testPayload ( final Class<? extends ObjectPayload<?>> payloadClass, final Class<?>[] addlClassesForClassLoader )
             throws Exception {
         String command = "hostname";
-        String[] deps = buildDeps(payloadClass);
 
         PayloadTest t = payloadClass.getAnnotation(PayloadTest.class);
 
+        int tries = 1;
         if ( t != null ) {
             if ( !t.skip().isEmpty() ) {
                 Assume.assumeTrue(t.skip(), false);
             }
 
             if ( !t.precondition().isEmpty() ) {
-                Assume.assumeTrue("Precondition", checkPrecondition(payloadClass, t.precondition()));
+                Assume.assumeTrue("Precondition: " + t.precondition(), checkPrecondition(payloadClass, t.precondition()));
+            }
+
+            if (! t.flaky().isEmpty()) {
+                tries = 5;
             }
         }
 
+        String[] deps = buildDeps(payloadClass);
         String payloadCommand = command;
         Class<?> customDeserializer = null;
-        Object wrapper = null;
+        Object testHarness = null;
         if ( t != null && !t.harness().isEmpty() ) {
-            Class<?> wrapperClass = Class.forName(t.harness());
+            Class<?> testHarnessClass = Class.forName(t.harness());
             try {
-                wrapper = wrapperClass.getConstructor(String.class).newInstance(command);
+                testHarness = testHarnessClass.getConstructor(String.class).newInstance(command);
             } catch ( NoSuchMethodException e ) {
-                wrapper = wrapperClass.newInstance();
+                testHarness = testHarnessClass.newInstance();
             }
-
-            if ( wrapper instanceof CustomPayloadArgs ) {
-                payloadCommand = ( (CustomPayloadArgs) wrapper ).getPayloadArgs();
-            }
-            
-            if ( wrapper instanceof CustomDeserializer ) {
-                customDeserializer = ((CustomDeserializer)wrapper).getCustomDeserializer();
-            }
+        } else {
+            testHarness = new CommandExecTest(); // default
         }
 
-        ExecCheckingSecurityManager sm = new ExecCheckingSecurityManager();
-        final byte[] serialized = sm.wrap(makeSerializeCallable(payloadClass, payloadCommand));
+        if ( testHarness instanceof CustomPayloadArgs ) {
+            payloadCommand = ( (CustomPayloadArgs) testHarness ).getPayloadArgs();
+        }
+
+        if ( testHarness instanceof CustomDeserializer ) {
+            customDeserializer = ((CustomDeserializer)testHarness).getCustomDeserializer();
+        }
+
+        // TODO per-thread secmgr to enforce no detonation during deserialization
+        final byte[] serialized = makeSerializeCallable(payloadClass, payloadCommand).call();
         Callable<Object> callable = makeDeserializeCallable(t, addlClassesForClassLoader, deps, serialized, customDeserializer);
-        if ( wrapper instanceof WrappedTest ) {
-            callable = ( (WrappedTest) wrapper ).createCallable(callable);
+        if ( testHarness instanceof WrappedTest ) {
+            callable = ( (WrappedTest) testHarness ).createCallable(callable);
         }
 
-        if ( wrapper instanceof CustomTest ) {
-            ( (CustomTest) wrapper ).run(callable);
-            return;
-        }
-        try {
-
-            Object deserialized = sm.wrap(callable);
-            Assert.fail(ASSERT_MESSAGE); // should never get here
-        }
-        catch ( Throwable e ) {
-            // hopefully everything will reliably nest our ExecException
-            Throwable innerEx = Throwables.getInnermostCause(e);
-            if ( ! ( innerEx instanceof ExecException ) ) {
-                innerEx.printStackTrace();
+        if (testHarness instanceof CustomTest) {
+            // if marked as flaky try up to 5 times
+            Exception ex = new Exception();
+            for (int i = 0; i < tries; i++) {
+                try {
+                    ((CustomTest) testHarness).run(callable);
+                    ex = null;
+                    break;
+                } catch (Exception e) {
+                    ex = e;
+                }
             }
-            Assert.assertEquals(ExecException.class, innerEx.getClass());
-            Assert.assertEquals(command, ( (ExecException) innerEx ).getCmd());
+            if (ex != null) throw ex;
         }
 
-        Assert.assertEquals(Arrays.asList(command), sm.getCmds());
     }
 
 
@@ -210,9 +199,9 @@ public class PayloadsTest {
                 }
                 byte[] deserializerClassBytes = ClassFiles.classAsBytes(Deserializer.class);
                 defineClass(Deserializer.class.getName(), deserializerClassBytes, 0, deserializerClassBytes.length);
-                
+
                 if ( customDeserializer != null ) {
-                    
+
                     try {
                         Method method = customDeserializer.getMethod("getExtraDependencies");
                         for ( Class extra : (Class[])method.invoke(null)) {
@@ -220,17 +209,25 @@ public class PayloadsTest {
                             defineClass(extra.getName(), deserializerClassBytes, 0, deserializerClassBytes.length);
                         }
                     } catch ( NoSuchMethodException e ) { }
-                    
+
                     deserializerClassBytes = ClassFiles.classAsBytes(customDeserializer);
                     defineClass(customDeserializer.getName(), deserializerClassBytes, 0, deserializerClassBytes.length);
                 }
-                
+
             }
         };
 
         Class<?> deserializerClass = isolatedClassLoader.loadClass(customDeserializer != null ? customDeserializer.getName() : Deserializer.class.getName());
         Callable<Object> deserializer = (Callable<Object>) deserializerClass.getConstructors()[ 0 ].newInstance(serialized);
-        final Object obj = deserializer.call();
-        return obj;
+
+        ClassLoader ccl = Thread.currentThread().getContextClassLoader();
+        try {
+            // set CCL for Clojure https://groups.google.com/forum/#!topic/clojure/F3ERon6Fye0
+            Thread.currentThread().setContextClassLoader(isolatedClassLoader);
+            final Object obj = deserializer.call();
+            return obj;
+        } finally {
+            Thread.currentThread().setContextClassLoader(ccl);
+        }
     }
 }
